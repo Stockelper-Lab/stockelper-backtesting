@@ -1,0 +1,53 @@
+version: "3.8"
+
+services:
+  backtesting-server:
+    container_name: stockelper-backtesting-server
+    build:
+      context: .
+    ports:
+      - "21011:21011"
+    environment:
+      # Server
+      HOST: ${HOST:-0.0.0.0}
+      PORT: ${PORT:-21011}
+      DEBUG: ${DEBUG:-false}
+
+      # DB (stockelper-fe Prisma의 DATABASE_URL과 호환되도록 둘 다 지원)
+      DATABASE_URL: ${DATABASE_URL:-}
+      ASYNC_DATABASE_URL: ${ASYNC_DATABASE_URL:-}
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:21011/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    networks:
+      - stockelper
+    restart: unless-stopped
+
+  backtest-worker:
+    container_name: stockelper-backtest-worker
+    build:
+      context: .
+    command: ["uv", "run", "python", "src/backtesting/worker.py"]
+    environment:
+      # DB
+      DATABASE_URL: ${DATABASE_URL:-}
+      ASYNC_DATABASE_URL: ${ASYNC_DATABASE_URL:-}
+
+      # Worker runtime
+      BACKTEST_SIMULATE_SECONDS: ${BACKTEST_SIMULATE_SECONDS:-300}
+      BACKTEST_WORKER_POLL_SECONDS: ${BACKTEST_WORKER_POLL_SECONDS:-5}
+    depends_on:
+      - backtesting-server
+    networks:
+      - stockelper
+    restart: unless-stopped
+
+networks:
+  stockelper:
+    name: stockelper
+
+
