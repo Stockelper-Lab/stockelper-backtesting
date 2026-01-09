@@ -1497,13 +1497,19 @@ class PortfolioStrategy(bt.Strategy):
             date: 리밸런싱 날짜
         """
         # 1단계: 현재 보유 종목 청산
+        # 주의: Backtrader에서 주문은 다음 bar에서 체결되므로,
+        # getposition().size가 0일 수 있음. portfolio_positions를 기준으로 청산.
         for symbol in list(self.portfolio_positions.keys()):
             if symbol in self.selected_symbols:
                 idx = self.selected_symbols.index(symbol)
                 pos = self.getposition(self.datas[idx])
-                if pos.size > 0:
+                recorded_size = self.portfolio_positions.get(symbol, 0)
+                
+                # 실제 포지션이 있거나, 기록된 포지션이 있으면 청산
+                if pos.size > 0 or recorded_size > 0:
                     self.close(data=self.datas[idx])
-                    self.log_trade(symbol, date, 'SELL', pos.size, 
+                    sell_size = pos.size if pos.size > 0 else recorded_size
+                    self.log_trade(symbol, date, 'SELL', sell_size, 
                                  self.datas[idx].close[0], '리밸런싱')
         
         self.portfolio_positions.clear()
@@ -2109,26 +2115,92 @@ async def run_backtest(input_params: BacktestInput) -> BacktestOutput:
     
     # Output 생성
     output = BacktestOutput()
-    output.cumulative_return = returns_analyzer.get('rtot', 0.0)
-    output.total_return = returns_analyzer.get('rtot', 0.0) * 100
-    output.annualized_return = returns_analyzer.get('rnorm100', 0.0)
-    output.mdd = abs(drawdown_analyzer.get('max', {}).get('drawdown', 0.0)) * 100
-    output.sharpe_ratio = sharpe_analyzer.get('sharperatio', 0.0) or 0.0
     
-    # trade_analyzer는 AutoDict이므로 트레이드가 없으면 KeyError 발생
-    try:
-        total_closed = trade_analyzer.total.closed
-        if total_closed:
-            output.total_trades = total_closed
-            output.win_rate = (trade_analyzer.won.total / total_closed) * 100 if total_closed > 0 else 0.0
-            output.total_profit = getattr(trade_analyzer.won.pnl, 'total', 0.0) or 0.0
-            output.total_loss = abs(getattr(trade_analyzer.lost.pnl, 'total', 0.0) or 0.0)
-    except (KeyError, AttributeError):
-        # 트레이드가 전혀 없는 경우
-        output.total_trades = 0
-        output.win_rate = 0.0
-        output.total_profit = 0.0
-        output.total_loss = 0.0
+    # Backtrader analyzer 결과 (주문이 체결되지 않으면 0일 수 있음)
+    bt_return = returns_analyzer.get('rtot', 0.0)
+    bt_mdd = abs(drawdown_analyzer.get('max', {}).get('drawdown', 0.0)) * 100
+    bt_sharpe = sharpe_analyzer.get('sharperatio', 0.0) or 0.0
+    
+    # trades_log 기반 성과 계산 (Backtrader analyzer가 0이면 대체)
+    trades_log = strat.trades_log
+    buys = [t for t in trades_log if t['action'] == 'BUY']
+    sells = [t for t in trades_log if t['action'] == 'SELL']
+    
+    # BUY와 SELL을 매칭하여 손익 계산
+    completed_trades = []
+    buy_dict = {}  # symbol -> list of buy records
+    for t in trades_log:
+        symbol = t['symbol']
+        if t['action'] == 'BUY':
+            if symbol not in buy_dict:
+                buy_dict[symbol] = []
+            buy_dict[symbol].append(t)
+        elif t['action'] == 'SELL':
+            if symbol in buy_dict and buy_dict[symbol]:
+                buy_record = buy_dict[symbol].pop(0)  # FIFO
+                pnl = (t['price'] - buy_record['price']) * t['size']
+                completed_trades.append({
+                    'symbol': symbol,
+                    'buy_date': buy_record['date'],
+                    'sell_date': t['date'],
+                    'buy_price': buy_record['price'],
+                    'sell_price': t['price'],
+                    'size': t['size'],
+                    'pnl': pnl,
+                    'pnl_pct': (t['price'] - buy_record['price']) / buy_record['price'] * 100
+                })
+    
+    # trades_log 기반 지표 계산
+    if completed_trades:
+        total_trades_from_log = len(completed_trades)
+        winning_trades = [t for t in completed_trades if t['pnl'] > 0]
+        losing_trades = [t for t in completed_trades if t['pnl'] <= 0]
+        
+        win_rate_from_log = len(winning_trades) / total_trades_from_log * 100 if total_trades_from_log > 0 else 0.0
+        total_profit_from_log = sum(t['pnl'] for t in winning_trades)
+        total_loss_from_log = abs(sum(t['pnl'] for t in losing_trades))
+        total_pnl = sum(t['pnl'] for t in completed_trades)
+        total_return_from_log = total_pnl / input_params.initial_cash * 100
+        
+        # Backtrader 결과가 0이면 trades_log 기반 결과 사용
+        output.total_trades = total_trades_from_log
+        output.win_rate = win_rate_from_log
+        output.total_profit = total_profit_from_log
+        output.total_loss = total_loss_from_log
+        output.total_return = total_return_from_log if abs(bt_return) < 0.0001 else bt_return * 100
+        output.cumulative_return = total_pnl / input_params.initial_cash if abs(bt_return) < 0.0001 else bt_return
+    else:
+        # trade_analyzer 사용 (fallback)
+        try:
+            total_closed = trade_analyzer.total.closed
+            if total_closed:
+                output.total_trades = total_closed
+                output.win_rate = (trade_analyzer.won.total / total_closed) * 100 if total_closed > 0 else 0.0
+                output.total_profit = getattr(trade_analyzer.won.pnl, 'total', 0.0) or 0.0
+                output.total_loss = abs(getattr(trade_analyzer.lost.pnl, 'total', 0.0) or 0.0)
+        except (KeyError, AttributeError):
+            output.total_trades = 0
+            output.win_rate = 0.0
+            output.total_profit = 0.0
+            output.total_loss = 0.0
+        output.total_return = bt_return * 100
+        output.cumulative_return = bt_return
+    
+    # 연환산 수익률 계산 (trades_log 기반)
+    if completed_trades:
+        # 백테스트 기간 계산
+        start_dt = datetime.strptime(input_params.start_date, "%Y-%m-%d")
+        end_dt = datetime.strptime(input_params.end_date, "%Y-%m-%d")
+        years = (end_dt - start_dt).days / 365.25
+        if years > 0 and output.cumulative_return > -1:
+            output.annualized_return = ((1 + output.cumulative_return) ** (1 / years) - 1) * 100
+        else:
+            output.annualized_return = returns_analyzer.get('rnorm100', 0.0)
+    else:
+        output.annualized_return = returns_analyzer.get('rnorm100', 0.0)
+    
+    output.mdd = bt_mdd
+    output.sharpe_ratio = bt_sharpe
     
     output.trades = strat.trades_log
     
