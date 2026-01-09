@@ -61,6 +61,7 @@ services:
 
 networks:
   stockelper:
+    external: true
     name: stockelper
 
 volumes:
