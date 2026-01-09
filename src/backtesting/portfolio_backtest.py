@@ -502,8 +502,13 @@ class DataLoader:
         self.input = input_params
         
         # PostgreSQL 연결 설정
+        # NOTE:
+        # - 이 프로젝트 의존성은 psycopg3(`psycopg[binary]`)를 포함합니다.
+        # - SQLAlchemy 기본 스킴 `postgresql://` 은 psycopg2를 기본 드라이버로 사용하므로,
+        #   운영 환경에서 psycopg2가 없을 경우 연결 실패가 날 수 있습니다.
+        # - 따라서 psycopg3 드라이버를 명시합니다.
         self.pg_engine = create_engine(
-            f'postgresql://{input_params.db_user}:{input_params.db_password}@'
+            f'postgresql+psycopg://{input_params.db_user}:{input_params.db_password}@'
             f'{input_params.db_host}:{input_params.db_port}/{input_params.db_name}'
         )
         

@@ -3,22 +3,28 @@ version: "3.8"
 services:
   backtesting-server:
     container_name: stockelper-backtesting-server
+    image: stockelper-backtesting-server:latest
     build:
       context: .
     ports:
-      - "21011:21011"
+      - "21007:21007"
     environment:
       # Server
       HOST: ${HOST:-0.0.0.0}
-      PORT: ${PORT:-21011}
+      PORT: ${PORT:-21007}
       DEBUG: ${DEBUG:-false}
 
       # DB (stockelper-fe Prisma의 DATABASE_URL과 호환되도록 둘 다 지원)
       DATABASE_URL: ${DATABASE_URL:-}
       ASYNC_DATABASE_URL: ${ASYNC_DATABASE_URL:-}
+      # 결과 파일 (artifact 다운로드용)
+      BACKTEST_RESULTS_DIR: ${BACKTEST_RESULTS_DIR:-outputs/backtesting_results}
+    volumes:
+      # worker가 저장한 결과 파일을 서버도 읽을 수 있도록 공유
+      - backtest_outputs:/app/outputs/backtesting_results
 
     healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:21011/health || exit 1"]
+      test: ["CMD-SHELL", "curl -f http://localhost:21007/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -37,9 +43,16 @@ services:
       DATABASE_URL: ${DATABASE_URL:-}
       ASYNC_DATABASE_URL: ${ASYNC_DATABASE_URL:-}
 
+      # LLM (해석 트리거)
+      STOCKELPER_LLM_URL: ${STOCKELPER_LLM_URL:-}
+      BACKTEST_LLM_TRIGGER_TIMEOUT: ${BACKTEST_LLM_TRIGGER_TIMEOUT:-10}
+
       # Worker runtime
       BACKTEST_SIMULATE_SECONDS: ${BACKTEST_SIMULATE_SECONDS:-300}
       BACKTEST_WORKER_POLL_SECONDS: ${BACKTEST_WORKER_POLL_SECONDS:-5}
+      BACKTEST_RESULTS_DIR: ${BACKTEST_RESULTS_DIR:-outputs/backtesting_results}
+    volumes:
+      - backtest_outputs:/app/outputs/backtesting_results
     depends_on:
       - backtesting-server
     networks:
@@ -49,5 +62,8 @@ services:
 networks:
   stockelper:
     name: stockelper
+
+volumes:
+  backtest_outputs:
 
 

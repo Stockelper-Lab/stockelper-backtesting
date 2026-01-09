@@ -6,6 +6,7 @@ description = "Stockelper Backtesting Service (FastAPI job API + worker)"
 requires-python = ">=3.12"
 dependencies = [
     "fastapi==0.111.0",
+    "backtrader",
     "requests",
     "httpx",
     "aiohttp",
