@@ -19,6 +19,7 @@ dependencies = [
     "statsmodels",
     "asyncpg",
     "psycopg[binary]==3.2.*",
+    "psycopg2-binary",
     "sqlalchemy>=2.0",
     "langchain>=1.0.0",
     "langchain-classic>=1.0.0",
