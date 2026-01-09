@@ -1,6 +1,11 @@
 # Stockelper Backtesting Service
 
-백테스팅 작업 생성, 실행 및 결과 조회를 위한 FastAPI 기반 서비스입니다.
+백테스팅 작업 생성, 실행 및 결과 적재를 위한 FastAPI 기반 서비스입니다.
+
+핵심 요구사항(운영):
+- LLM 서버에서 요청을 받으면 **즉시 `stockelper_web.public.backtesting`에 placeholder row 생성**
+- 백테스트 실행은 워커가 처리(시간 소요)
+- 완료 시 **결과 파일 경로 + 상태(completed/failed)로 row 업데이트**
 
 ## 🚀 주요 기능
 
@@ -38,40 +43,54 @@
 - `GET /notifications?user_id=...&unread_only=false&limit=50` - 알림 목록
 - `POST /notifications/{notification_id}/read` - 읽음 처리
 
-## 🗄️ 데이터베이스 스키마
+## 🗄️ 데이터베이스 스키마(권장)
 
-### backtest_jobs
-- id, user_id, stock_ticker, strategy_type
+### public.backtesting (stockelper_web)
+- id (text, PK)
+- job_id (text, unique)
+- user_id (int)
+- request_source (text, default 'llm')
 - status (pending|in_progress|completed|failed)
-- input_json (JSONB), error_message
-- created_at, started_at, completed_at
+- input_json (JSONB)
+- output_json (JSONB) : 가벼운 요약(핵심 지표)
+- result_file_path (text) : 결과 JSON 파일 경로
+- report_file_path (text) : 리포트(Markdown) 파일 경로
+- error_message (text)
+- created_at, updated_at, started_at, completed_at, elapsed_seconds
 
-### backtest_results
-- id, job_id, user_id, stock_ticker, strategy_type
-- results_json (JSONB)
-- generated_at
-
-### notifications
-- id, user_id, type, title, message
-- data (JSONB), is_read, read_at
-- created_at
+DDL 예시는 `migrations/001_create_public_backtesting.sql` 참고
 
 ## ⚙️ 환경 변수
 
 ```bash
-# 데이터베이스 (필수)
-ASYNC_DATABASE_URL=postgresql+asyncpg://user:pass@host:5432/db
-# 또는
-DATABASE_URL=postgresql://user:pass@host:5432/db  # 자동 변환
+# 결과 적재 DB (필수): stockelper_web
+# 예) postgresql://postgres:postgres@54.180.25.182:5432/stockelper_web
+DATABASE_URL=postgresql://user:pass@host:5432/stockelper_web
+
+# (선택) schema/table
+STOCKELPER_WEB_SCHEMA=public
+STOCKELPER_BACKTESTING_TABLE=backtesting
+
+# 시장데이터 DB(백테스트 입력 데이터): portfolio_backtest.DataLoader가 사용
+DB_USER=stockelper
+DB_PASSWORD=
+DB_HOST=localhost
+DB_PORT=5432
+DB_NAME=postgres
 
 # 서버 설정
 HOST=0.0.0.0
-PORT=21011
+PORT=21007
 DEBUG=false
 
 # 워커 설정
-BACKTEST_SIMULATE_SECONDS=300    # MVP 시뮬레이션 시간
 BACKTEST_WORKER_POLL_SECONDS=5   # 폴링 간격
+BACKTEST_RESULTS_DIR=outputs/backtesting_results  # 결과 파일 저장 위치
+
+# (선택) LLM 해석 자동화
+# - 백테스트 완료 직후, LLM 서버에 해석 생성을 요청합니다.
+STOCKELPER_LLM_URL=http://54.180.25.182:21009
+BACKTEST_LLM_TRIGGER_TIMEOUT=10
 ```
 
 ## 🚀 빠른 시작
@@ -103,21 +122,22 @@ docker-compose logs -f backtest-worker
 1. `BACKTEST_WORKER_POLL_SECONDS`마다 DB 폴링
 2. `SELECT ... FOR UPDATE SKIP LOCKED`로 작업 예약
 3. 상태를 `pending` → `in_progress`로 변경
-4. MVP 시뮬레이션 실행 (실제 백테스트 로직 예정)
-5. 결과 저장 및 상태를 `completed`로 변경
-6. 사용자 알림 생성
+4. `portfolio_backtest.run_backtest()` 실행
+5. 결과(JSON/Markdown) 파일 저장
+6. 상태를 `completed`(또는 `failed`)로 변경 + 파일 경로 업데이트
 
 ### 별도 실행
 
 ```bash
 # 워커만 실행
-uv run python src/backtesting/worker.py
+# src 레이아웃이므로 -m 실행을 권장합니다.
+PYTHONPATH=src uv run python -m backtesting.worker
 ```
 
 ## 🐳 Docker 구성
 
 ### 서비스
-- **backtesting-server** (포트: 21011)
+- **backtesting-server** (포트: 21007)
   - FastAPI 애플리케이션
   - 헬스체크: `/health`
 - **backtest-worker**
@@ -132,7 +152,7 @@ uv run python src/backtesting/worker.py
 ### 작업 생성
 
 ```bash
-curl -X POST http://localhost:21011/api/backtesting/execute   -H "Content-Type: application/json"   -d '{
+curl -X POST http://localhost:21007/api/backtesting/execute   -H "Content-Type: application/json"   -d '{
     "user_id": 1,
     "stock_ticker": "005930",
     "strategy_type": "momentum",
@@ -143,13 +163,13 @@ curl -X POST http://localhost:21011/api/backtesting/execute   -H "Content-Type: 
 ### 상태 조회
 
 ```bash
-curl http://localhost:21011/api/backtesting/{job_id}/status?user_id=1
+curl http://localhost:21007/api/backtesting/{job_id}/status?user_id=1
 ```
 
 ### 결과 조회
 
 ```bash
-curl http://localhost:21011/api/backtesting/{job_id}/result?user_id=1
+curl http://localhost:21007/api/backtesting/{job_id}/result?user_id=1
 ```
 
 ## 🔒 보안

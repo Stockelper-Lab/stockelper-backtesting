@@ -2,6 +2,9 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# src 레이아웃 import 지원 (worker가 -m/backtesting.* 로 실행될 때 필요)
+ENV PYTHONPATH="/app/src"
+
 # PostgreSQL 관련 라이브러리 설치
 RUN apt-get update && apt-get install -y \
     build-essential \
@@ -30,5 +33,5 @@ COPY . .
 ENV PORT=21011
 EXPOSE 21011
 
-# 애플리케이션 실행
-CMD ["uv", "run", "python", "src/main.py"]
+# 애플리케이션 실행 (이미 uv sync로 .venv가 생성되었으므로 직접 실행)
+CMD [".venv/bin/python", "src/main.py"]

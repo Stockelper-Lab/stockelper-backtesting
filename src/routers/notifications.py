@@ -1,38 +1,31 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query, status
-from pydantic import BaseModel, Field
-
-from notifications.service import list_notifications, mark_notification_read
+from fastapi import APIRouter, Query, status
 
 router = APIRouter(prefix="/notifications", tags=["notifications"])
 
 
-class NotificationReadRequest(BaseModel):
-    user_id: int = Field(description="User ID")
-
-
 @router.get("", status_code=status.HTTP_200_OK)
-async def get_notifications(
-    user_id: int = Query(..., description="User ID"),
-    unread_only: bool = Query(False, description="Return only unread notifications"),
-    limit: int = Query(50, ge=1, le=200, description="Max number of notifications"),
+async def list_notifications(
+    user_id: int = Query(..., description="stockelper_web.users.id"),
+    unread_only: bool = Query(False, description="읽지 않은 알림만 조회"),
+    limit: int = Query(50, ge=1, le=200),
 ):
-    return {
-        "notifications": await list_notifications(
-            user_id=user_id, unread_only=unread_only, limit=limit
-        )
-    }
+    """알림 목록 (현재는 스텁).
+
+    NOTE: 현 시점 요구사항은 백테스트 결과 적재가 핵심이라,
+    notifications 스키마/거버넌스 확정 전까지는 최소 동작만 제공합니다.
+    """
+
+    return {"user_id": user_id, "unread_only": unread_only, "items": [], "limit": limit}
 
 
 @router.post("/{notification_id}/read", status_code=status.HTTP_200_OK)
-async def read_notification(notification_id: int, body: NotificationReadRequest):
-    ok = await mark_notification_read(user_id=body.user_id, notification_id=notification_id)
-    if not ok:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="알림을 찾을 수 없거나 이미 읽음 처리되었습니다.",
-        )
-    return {"ok": True}
+async def mark_read(
+    notification_id: str,
+    user_id: int = Query(..., description="stockelper_web.users.id"),
+):
+    """알림 읽음 처리 (현재는 스텁)."""
 
+    return {"ok": True, "notification_id": notification_id, "user_id": user_id}
 
