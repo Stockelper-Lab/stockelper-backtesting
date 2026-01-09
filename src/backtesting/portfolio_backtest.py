@@ -1573,9 +1573,9 @@ class PortfolioStrategy(bt.Strategy):
                         disclosure = latest_event.get('disclosure', 0)
                         event_type = latest_event.get('event_type', 'general')
                         
-                    if disclosure == 1:  # 긍정적 이벤트
-                        should_buy = True
-                        reason = f'긍정 이벤트: {event_type}'
+                        if disclosure == 1:  # 긍정적 이벤트
+                            should_buy = True
+                            reason = f'긍정 이벤트: {event_type}'
                 except:
                     pass
             
