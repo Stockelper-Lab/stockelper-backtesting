@@ -8,6 +8,116 @@ from typing import Any, Dict, Optional
 import asyncpg
 
 # ============================================================
+# Auto init (optional): create/alter table if missing
+# ============================================================
+
+def _to_bool(v: Optional[str], default: bool = False) -> bool:
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _auto_init_enabled() -> bool:
+    # 기본값: true (초기 구축 단계에서 운영 편의성)
+    return _to_bool(os.getenv("STOCKELPER_BACKTESTING_AUTO_INIT_DB"), default=True)
+
+
+async def ensure_backtesting_table(*, conn: asyncpg.Connection, schema: str, table: str) -> None:
+    """public.backtesting 테이블이 없거나 컬럼이 부족하면 보강합니다.
+
+    NOTE:
+    - 운영 환경에서는 DB 권한이 제한될 수 있습니다.
+      (그 경우 이 함수가 실패하면 insert도 실패하므로, 마이그레이션을 수동 적용해야 합니다.)
+    - schema/table 이름은 이미 정규식 검증을 통과한 값이어야 합니다.
+    """
+
+    # schema 생성 (public이면 사실상 noop)
+    await conn.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+
+    # 테이블 생성 (최신 스키마 기준)
+    await conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {schema}.{table} (
+          id               text PRIMARY KEY,
+          job_id           text NOT NULL UNIQUE,
+          user_id          integer NOT NULL,
+          request_source   text NOT NULL DEFAULT 'llm',
+          status           text NOT NULL,
+
+          input_json       jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+          output_json      jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+
+          result_file_path text NULL,
+          report_file_path text NULL,
+          error_message    text NULL,
+
+          analysis_status          text NOT NULL DEFAULT 'pending',
+          analysis_md              text NULL,
+          analysis_json            jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+          analysis_model           text NULL,
+          analysis_prompt_version  text NULL,
+          analysis_error_message   text NULL,
+          analysis_started_at      timestamptz NULL,
+          analysis_completed_at    timestamptz NULL,
+          analysis_elapsed_seconds double precision NULL,
+
+          elapsed_seconds  double precision NULL,
+          started_at       timestamptz NULL,
+          completed_at     timestamptz NULL,
+
+          created_at       timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          updated_at       timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    # 기존 테이블(구버전) 보강: 컬럼이 없으면 추가
+    # - 이미 존재하는 경우에도 IF NOT EXISTS라 안전
+    await conn.execute(
+        f"""
+        ALTER TABLE {schema}.{table}
+          ADD COLUMN IF NOT EXISTS request_source   text NOT NULL DEFAULT 'llm',
+          ADD COLUMN IF NOT EXISTS status           text NOT NULL DEFAULT 'pending',
+          ADD COLUMN IF NOT EXISTS input_json       jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+          ADD COLUMN IF NOT EXISTS output_json      jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+          ADD COLUMN IF NOT EXISTS result_file_path text NULL,
+          ADD COLUMN IF NOT EXISTS report_file_path text NULL,
+          ADD COLUMN IF NOT EXISTS error_message    text NULL,
+          ADD COLUMN IF NOT EXISTS elapsed_seconds  double precision NULL,
+          ADD COLUMN IF NOT EXISTS started_at       timestamptz NULL,
+          ADD COLUMN IF NOT EXISTS completed_at     timestamptz NULL,
+          ADD COLUMN IF NOT EXISTS created_at       timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          ADD COLUMN IF NOT EXISTS updated_at       timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+          ADD COLUMN IF NOT EXISTS analysis_status          text NOT NULL DEFAULT 'pending',
+          ADD COLUMN IF NOT EXISTS analysis_md              text NULL,
+          ADD COLUMN IF NOT EXISTS analysis_json            jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+          ADD COLUMN IF NOT EXISTS analysis_model           text NULL,
+          ADD COLUMN IF NOT EXISTS analysis_prompt_version  text NULL,
+          ADD COLUMN IF NOT EXISTS analysis_error_message   text NULL,
+          ADD COLUMN IF NOT EXISTS analysis_started_at      timestamptz NULL,
+          ADD COLUMN IF NOT EXISTS analysis_completed_at    timestamptz NULL,
+          ADD COLUMN IF NOT EXISTS analysis_elapsed_seconds double precision NULL
+        """
+    )
+
+    # 인덱스
+    await conn.execute(
+        f"CREATE INDEX IF NOT EXISTS backtesting_user_created_at_idx ON {schema}.{table} (user_id, created_at DESC)"
+    )
+    await conn.execute(
+        f"CREATE INDEX IF NOT EXISTS backtesting_status_created_at_idx ON {schema}.{table} (status, created_at DESC)"
+    )
+    await conn.execute(
+        f"CREATE INDEX IF NOT EXISTS backtesting_analysis_status_created_at_idx ON {schema}.{table} (analysis_status, created_at DESC)"
+    )
+
+# ============================================================
 # stockelper_web DB helpers (asyncpg)
 # ============================================================
 
@@ -59,6 +169,10 @@ async def insert_backtesting_job(
 
     conn = await asyncpg.connect(dsn)
     try:
+        # (옵션) 테이블 자동 생성/보강
+        if _auto_init_enabled():
+            await ensure_backtesting_table(conn=conn, schema=schema, table=table)
+
         # created_at은 DEFAULT now() 를 권장. (없다면 아래에서 직접 넣도록 DDL을 맞춰주세요)
         await conn.execute(
             f"""

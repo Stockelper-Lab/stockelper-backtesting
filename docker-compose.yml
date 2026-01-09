@@ -13,6 +13,8 @@ services:
       HOST: ${HOST:-0.0.0.0}
       PORT: ${PORT:-21007}
       DEBUG: ${DEBUG:-false}
+      # Python path (src 레이아웃)
+      PYTHONPATH: /app/src
 
       # DB (stockelper-fe Prisma의 DATABASE_URL과 호환되도록 둘 다 지원)
       DATABASE_URL: ${DATABASE_URL:-}
@@ -37,11 +39,13 @@ services:
     container_name: stockelper-backtest-worker
     build:
       context: .
-    command: ["uv", "run", "python", "src/backtesting/worker.py"]
+    command: ["uv", "run", "python", "-m", "backtesting.worker"]
     environment:
       # DB
       DATABASE_URL: ${DATABASE_URL:-}
       ASYNC_DATABASE_URL: ${ASYNC_DATABASE_URL:-}
+      # Python path (src 레이아웃)
+      PYTHONPATH: /app/src
 
       # LLM (해석 트리거)
       STOCKELPER_LLM_URL: ${STOCKELPER_LLM_URL:-}

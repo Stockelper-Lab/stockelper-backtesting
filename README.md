@@ -130,7 +130,8 @@ docker-compose logs -f backtest-worker
 
 ```bash
 # 워커만 실행
-uv run python src/backtesting/worker.py
+# src 레이아웃이므로 -m 실행을 권장합니다.
+PYTHONPATH=src uv run python -m backtesting.worker
 ```
 
 ## 🐳 Docker 구성

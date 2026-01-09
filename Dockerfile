@@ -2,6 +2,9 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+# src 레이아웃 import 지원 (worker가 -m/backtesting.* 로 실행될 때 필요)
+ENV PYTHONPATH="/app/src"
+
 # PostgreSQL 관련 라이브러리 설치
 RUN apt-get update && apt-get install -y \
     build-essential \

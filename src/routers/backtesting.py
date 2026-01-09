@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -10,6 +11,8 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from backtesting.web_db import get_backtesting_job, insert_backtesting_job
+
+logger = logging.getLogger(__name__)
 
 # ============================================================
 # Routers
@@ -156,6 +159,8 @@ async def execute_backtesting(body: BacktestingExecuteRequest):
             request_source="llm",
         )
     except Exception as e:
+        # 운영에서 502만 찍히는 문제를 줄이기 위해 상세 로그를 남깁니다.
+        logger.exception("backtesting job insert failed: %s", e)
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"backtesting job insert failed: {e}",
