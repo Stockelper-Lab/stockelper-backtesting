@@ -41,9 +41,19 @@ services:
       context: .
     command: [".venv/bin/python", "-m", "backtesting.worker"]
     environment:
-      # DB
+      # Result DB (stockelper_web - 잡/결과/해석 저장)
       DATABASE_URL: ${DATABASE_URL:-}
       ASYNC_DATABASE_URL: ${ASYNC_DATABASE_URL:-}
+      
+      # Source Data DB (주가/공시/지표 조회)
+      # 주의: Docker 네트워크 내부에서는 컨테이너 내부 포트(5432)를 사용해야 함
+      # .env의 DB_PORT(21002)는 호스트→컨테이너 매핑용이므로 여기선 5432 고정
+      DB_USER: ${DB_USER:-stockelper}
+      DB_PASSWORD: ${DB_PASSWORD:-}
+      DB_HOST: ${DB_HOST:-stockelper-postgresql}
+      DB_PORT: "5432"
+      DB_NAME: ${DB_NAME:-postgres}
+      
       # Python path (src 레이아웃)
       PYTHONPATH: /app/src
 

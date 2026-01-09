@@ -2115,11 +2115,20 @@ async def run_backtest(input_params: BacktestInput) -> BacktestOutput:
     output.mdd = abs(drawdown_analyzer.get('max', {}).get('drawdown', 0.0)) * 100
     output.sharpe_ratio = sharpe_analyzer.get('sharperatio', 0.0) or 0.0
     
-    if trade_analyzer.total.closed:
-        output.total_trades = trade_analyzer.total.closed
-        output.win_rate = (trade_analyzer.won.total / trade_analyzer.total.closed) * 100
-        output.total_profit = trade_analyzer.won.pnl.total
-        output.total_loss = abs(trade_analyzer.lost.pnl.total)
+    # trade_analyzer는 AutoDict이므로 트레이드가 없으면 KeyError 발생
+    try:
+        total_closed = trade_analyzer.total.closed
+        if total_closed:
+            output.total_trades = total_closed
+            output.win_rate = (trade_analyzer.won.total / total_closed) * 100 if total_closed > 0 else 0.0
+            output.total_profit = getattr(trade_analyzer.won.pnl, 'total', 0.0) or 0.0
+            output.total_loss = abs(getattr(trade_analyzer.lost.pnl, 'total', 0.0) or 0.0)
+    except (KeyError, AttributeError):
+        # 트레이드가 전혀 없는 경우
+        output.total_trades = 0
+        output.win_rate = 0.0
+        output.total_profit = 0.0
+        output.total_loss = 0.0
     
     output.trades = strat.trades_log
     
