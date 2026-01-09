@@ -39,7 +39,7 @@ services:
     container_name: stockelper-backtest-worker
     build:
       context: .
-    command: ["uv", "run", "python", "-m", "backtesting.worker"]
+    command: [".venv/bin/python", "-m", "backtesting.worker"]
     environment:
       # DB
       DATABASE_URL: ${DATABASE_URL:-}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import uuid
@@ -186,8 +187,8 @@ async def insert_backtesting_job(
             int(user_id),
             str(request_source),
             "pending",
-            dict(input_json),
-            {},
+            json.dumps(input_json, ensure_ascii=False, default=str),
+            json.dumps({}, ensure_ascii=False),
         )
     finally:
         await conn.close()
@@ -242,6 +243,20 @@ async def get_backtesting_job(*, job_id: str, user_id: int) -> Optional[Dict[str
 
         # asyncpg.Record -> dict
         data = dict(row)
+        
+        # jsonb 필드: asyncpg가 문자열로 반환할 수 있으므로 dict로 파싱
+        for k in ("input_json", "output_json", "analysis_json"):
+            v = data.get(k)
+            if v is None:
+                data[k] = {}
+            elif isinstance(v, str):
+                try:
+                    data[k] = json.loads(v)
+                except Exception:
+                    data[k] = {}
+            elif not isinstance(v, dict):
+                data[k] = {}
+        
         # datetime -> iso string (FastAPI가 자동 인코딩해주기도 하지만 안정적으로 문자열화)
         for k in (
             "created_at",
@@ -326,7 +341,7 @@ async def mark_job_completed(
             WHERE job_id = $1
             """,
             str(job_id),
-            dict(output_json),
+            json.dumps(output_json, ensure_ascii=False, default=str),
             result_file_path,
             report_file_path,
             elapsed_seconds,

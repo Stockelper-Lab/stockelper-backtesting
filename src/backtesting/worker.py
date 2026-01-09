@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -12,6 +13,8 @@ from sqlalchemy import text
 
 from backtesting.portfolio_backtest import BacktestInput, DataLoader, run_backtest
 from backtesting.web_db import claim_next_pending_job, mark_job_completed, mark_job_failed
+
+logger = logging.getLogger(__name__)
 
 _STOCK_CODE_RE = re.compile(r"\b\d{6}\b")
 _HANGUL_TOKEN_RE = re.compile(r"[가-힣A-Za-z]{2,}")
@@ -70,10 +73,24 @@ def _resolve_backtest_input(payload: Dict[str, Any]) -> BacktestInput:
     - LLM 기본 포맷: {user_id, stock_symbol, strategy_type, query, parameters?}
     - 권장 포맷: { ..., parameters: {BacktestInput에 해당하는 키들...} }
     """
+    # asyncpg가 jsonb를 문자열로 반환할 수 있으므로 파싱
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception:
+            payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
 
     params: Dict[str, Any] = {}
 
     raw_params = payload.get("parameters")
+    # parameters도 문자열일 수 있음
+    if isinstance(raw_params, str):
+        try:
+            raw_params = json.loads(raw_params)
+        except Exception:
+            raw_params = {}
     if isinstance(raw_params, dict):
         params.update(raw_params)
 
@@ -127,16 +144,60 @@ def _resolve_backtest_input(payload: Dict[str, Any]) -> BacktestInput:
                 # 매핑 실패 시 무시하고 아래 안전장치에서 실패 처리
                 pass
 
+    # target_corp_names가 있으면 target_symbols로 변환 시도
+    target_corp_names = params.get("target_corp_names")
+    if target_corp_names and isinstance(target_corp_names, list) and not params.get("target_symbols"):
+        try:
+            base_input = BacktestInput()
+            loader = DataLoader(base_input)
+            resolved_symbols = []
+            with loader.pg_engine.connect() as conn:
+                for corp_name in target_corp_names:
+                    if not isinstance(corp_name, str) or not corp_name.strip():
+                        continue
+                    res = conn.execute(
+                        text(
+                            """
+                            SELECT DISTINCT stock_code
+                            FROM score_table_dart_idc
+                            WHERE corp_name = :corp_name
+                            LIMIT 1
+                            """
+                        ),
+                        {"corp_name": corp_name.strip()},
+                    )
+                    row = res.fetchone()
+                    if row and row[0]:
+                        resolved_symbols.append(row[0])
+                        logger.info("Resolved corp_name=%s -> stock_code=%s", corp_name, row[0])
+                    else:
+                        logger.warning("Could not resolve corp_name=%s to stock_code", corp_name)
+            if resolved_symbols:
+                params["target_symbols"] = sorted(set(resolved_symbols))
+        except Exception as e:
+            logger.warning("Failed to resolve target_corp_names to target_symbols: %s", e)
+
     # 안전장치: 대상 종목이 없으면 전체 유니버스 백테스트가 되어 DB 부하가 큼
     allow_full = os.getenv("ALLOW_FULL_UNIVERSE", "false").strip().lower() in {
         "1",
         "true",
         "yes",
     }
-    if not allow_full and not params.get("target_symbols") and not params.get("target_corp_names"):
+    has_target_symbols = params.get("target_symbols") and len(params.get("target_symbols", [])) > 0
+    has_target_corp_names = params.get("target_corp_names") and len(params.get("target_corp_names", [])) > 0
+    
+    if not allow_full and not has_target_symbols and not has_target_corp_names:
         raise ValueError(
             "백테스트 대상 종목을 찾을 수 없습니다. "
-            "parameters.target_symbols(6자리 코드 리스트) 또는 stock_symbol을 제공해주세요."
+            "parameters.target_symbols(6자리 코드 리스트), parameters.target_corp_names(회사명 리스트), "
+            "또는 stock_symbol을 제공해주세요."
+        )
+    
+    # target_corp_names만 있고 target_symbols로 변환 실패한 경우
+    if not has_target_symbols and has_target_corp_names:
+        raise ValueError(
+            f"회사명 {params.get('target_corp_names')}을(를) 종목코드로 변환할 수 없습니다. "
+            "score_table_dart_idc 테이블에 해당 회사의 데이터가 없거나, 회사명이 정확하지 않을 수 있습니다."
         )
 
     # 기본값 보정(대상 종목이 있으면, 그 크기에 맞게 과도한 스크리닝을 피함)
@@ -201,8 +262,18 @@ def _build_output_summary(output: Any) -> Dict[str, Any]:
 async def _process_one(job: Dict[str, Any]) -> None:
     job_id = str(job.get("job_id") or "")
     payload = job.get("input_json") or {}
+    
+    # asyncpg가 jsonb를 문자열로 반환할 수 있으므로 파싱
+    if isinstance(payload, str):
+        try:
+            payload = json.loads(payload)
+        except Exception as e:
+            logger.warning("Failed to parse input_json as JSON: %s", e)
+            payload = {}
     if not isinstance(payload, dict):
         payload = {}
+    
+    logger.debug("Processing job %s with payload keys: %s", job_id, list(payload.keys()) if payload else [])
 
     t0 = time.time()
     try:
