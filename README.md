@@ -126,6 +126,13 @@ docker-compose logs -f backtest-worker
 5. 결과(JSON/Markdown) 파일 저장
 6. 상태를 `completed`(또는 `failed`)로 변경 + 파일 경로 업데이트
 
+### (선택) OpenAI Agents SDK 기반 오케스트레이션
+- `BACKTEST_USE_AGENTS=true`를 설정하면 워커가 아래 단계를 추가로 수행합니다:
+  - 입력 파싱(LLM) → 데이터 사전검증(preflight) → 실행 → 결과 감사(audit) → 리포트(LLM) → DB 적재(analysis_* 포함)
+- 필요 환경변수:
+  - `OPENAI_API_KEY`
+  - (선택) `BACKTEST_AGENT_MODEL_PARSE/ADJUST/AUDIT/REPORT`, `BACKTEST_AGENT_MAX_RETRIES`
+
 ### 별도 실행
 
 ```bash

@@ -260,6 +260,20 @@ def _build_output_summary(output: Any) -> Dict[str, Any]:
 
 
 async def _process_one(job: Dict[str, Any]) -> None:
+    # Agents SDK 기반 파이프라인(기능 플래그)
+    use_agents = os.getenv("BACKTEST_USE_AGENTS", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }
+    if use_agents:
+        from backtesting.agents.orchestrator import process_job
+
+        await process_job(job)
+        return
+
     job_id = str(job.get("job_id") or "")
     payload = job.get("input_json") or {}
     

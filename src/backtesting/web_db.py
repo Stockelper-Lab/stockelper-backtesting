@@ -351,6 +351,80 @@ async def mark_job_completed(
         await conn.close()
 
 
+async def mark_job_completed_with_analysis(
+    *,
+    job_id: str,
+    output_json: Dict[str, Any],
+    result_file_path: Optional[str],
+    report_file_path: Optional[str],
+    elapsed_seconds: Optional[float],
+    analysis_md: Optional[str],
+    analysis_json: Optional[Dict[str, Any]],
+    analysis_model: Optional[str],
+    analysis_prompt_version: Optional[str],
+    analysis_elapsed_seconds: Optional[float],
+) -> bool:
+    """completed 업데이트 + analysis_* 컬럼을 함께 적재합니다.
+
+    - analysis_md / analysis_json이 모두 비어 있으면 기존 `mark_job_completed`와 동일하게 동작합니다.
+    - analysis 컬럼은 `public.backtesting` 권장 스키마에 포함되어 있어야 합니다.
+    """
+
+    has_analysis = bool((analysis_md and str(analysis_md).strip()) or (analysis_json and len(analysis_json) > 0))
+    if not has_analysis:
+        return await mark_job_completed(
+            job_id=job_id,
+            output_json=output_json,
+            result_file_path=result_file_path,
+            report_file_path=report_file_path,
+            elapsed_seconds=elapsed_seconds,
+        )
+
+    schema = _get_schema()
+    table = _get_table()
+    dsn = _get_database_url_for_asyncpg()
+
+    conn = await asyncpg.connect(dsn)
+    try:
+        res = await conn.execute(
+            f"""
+            UPDATE {schema}.{table}
+            SET status = 'completed',
+                output_json = $2,
+                result_file_path = $3,
+                report_file_path = $4,
+                error_message = NULL,
+                elapsed_seconds = $5,
+                completed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP,
+
+                analysis_status = 'completed',
+                analysis_md = $6,
+                analysis_json = $7,
+                analysis_model = $8,
+                analysis_prompt_version = $9,
+                analysis_error_message = NULL,
+                analysis_started_at = COALESCE(analysis_started_at, CURRENT_TIMESTAMP),
+                analysis_completed_at = CURRENT_TIMESTAMP,
+                analysis_elapsed_seconds = $10
+            WHERE job_id = $1
+            """,
+            str(job_id),
+            json.dumps(output_json, ensure_ascii=False, default=str),
+            result_file_path,
+            report_file_path,
+            elapsed_seconds,
+            str(analysis_md or ""),
+            json.dumps(analysis_json or {}, ensure_ascii=False, default=str),
+            analysis_model,
+            analysis_prompt_version,
+            analysis_elapsed_seconds,
+        )
+        return str(res).strip().endswith("1")
+    finally:
+        await conn.close()
+
+
 async def mark_job_failed(
     *,
     job_id: str,
