@@ -105,6 +105,55 @@ def _apply_metric_filter_and_sort(
     return [s for s, _ in items]
 
 
+def _collapse_daily_disclosures(disclosure_df: pd.DataFrame) -> pd.DataFrame:
+    """공시 데이터가 동일 일자에 여러 건 존재할 때 1일 1행으로 축약합니다.
+
+    Backtrader 데이터피드에 join할 때 인덱스 중복으로 인해 가격 데이터가 "행 증식"되는 것을
+    방지하고, 일자 단위 신호 판단을 안정화합니다.
+
+    - disclosure 우선순위: 부정(2) > 긍정(1) > 중립(3) > 없음(0)
+    - 나머지 컬럼(report_type/category/event_type 등)은 선택된 disclosure 그룹의 마지막 행을 대표로 사용
+    """
+    if disclosure_df is None or disclosure_df.empty:
+        return pd.DataFrame(columns=disclosure_df.columns if disclosure_df is not None else None)
+
+    if not disclosure_df.index.has_duplicates:
+        return disclosure_df.sort_index()
+
+    df = disclosure_df.sort_index()
+    rows: list[pd.Series] = []
+
+    # index가 datetime일 것을 가정(현재 구현은 rcept_dt(date) -> datetime 변환)
+    for dt, grp in df.groupby(level=0, sort=True):
+        g = grp.copy()
+        if "disclosure" in g.columns:
+            disc = pd.to_numeric(g["disclosure"], errors="coerce").fillna(0).astype(int)
+            g["disclosure"] = disc
+        else:
+            g["disclosure"] = 0
+
+        chosen: Optional[pd.Series] = None
+        for code in (2, 1, 3, 0):
+            sub = g[g["disclosure"] == code]
+            if not sub.empty:
+                chosen = sub.iloc[-1]
+                chosen = chosen.copy()
+                chosen["disclosure"] = int(code)
+                break
+
+        if chosen is None:
+            chosen = g.iloc[-1].copy()
+            chosen["disclosure"] = int(chosen.get("disclosure", 0) or 0)
+
+        chosen.name = dt
+        rows.append(chosen)
+
+    out = pd.DataFrame(rows)
+    out.index = pd.to_datetime(out.index, errors="coerce")
+    out = out[~out.index.isna()]
+    return out.sort_index()
+
+
 # ============================================================
 # Input 파라미터 정의
 # ============================================================
@@ -725,7 +774,9 @@ class DataLoader:
             result_df = pd.DataFrame(all_data)
             result_df = result_df.set_index('date')
             result_df = result_df.sort_index()
-            
+
+            # 동일 일자 공시가 여러 건인 경우 1일 1행으로 축약(인덱스 중복 방지 + 신호 우선순위 반영)
+            result_df = _collapse_daily_disclosures(result_df)
             return result_df
                     
         except Exception as e:
@@ -755,7 +806,9 @@ class DataLoader:
         """
         if self.use_dart:
             # DART 공시 데이터 사용
-            return self.get_dart_disclosure_data(symbol, start_date, end_date)
+            return self.get_dart_disclosure_data(
+                symbol=symbol, start_date=start_date, end_date=end_date
+            )
         
         # 레거시: 빈 DataFrame 반환
         return pd.DataFrame(columns=['event_type', 'disclosure'])
@@ -1409,6 +1462,7 @@ class PortfolioStrategy(bt.Strategy):
     params = dict(
         rebalancing_period=30,  # 리밸런싱 주기 (일)
         max_positions=10,  # 최대 보유 종목 수
+        order_cash_buffer=0.98,  # 체결가(다음 bar) 변동/수수료를 고려한 보수적 버퍼
     )
     
     def __init__(
@@ -1448,8 +1502,8 @@ class PortfolioStrategy(bt.Strategy):
         self.indicator_data = indicator_data or {}
         self.event_indicator_conditions = event_indicator_conditions or []
         self.rebalance_date = None  # 마지막 리밸런싱 날짜
-        self.portfolio_positions = {}  # 현재 보유 포지션 {symbol: size}
-        self.trades_log = []  # 거래 내역 로그
+        self.trades_log: List[Dict[str, Any]] = []  # 체결 기반 거래 내역 로그
+        self._order_meta: Dict[int, Dict[str, Any]] = {}  # order.ref -> meta(reason 등)
         
         # 각 종목에 대한 기술적 지표 계산
         # SMA(이동평균선)와 ATR(평균 진폭)을 계산하여 추세와 변동성 파악
@@ -1461,6 +1515,55 @@ class PortfolioStrategy(bt.Strategy):
                 'sma_slow': bt.indicators.SMA(data.close, period=30),  # 장기 이동평균
                 'atr': bt.indicators.ATR(data, period=14),  # 평균 진폭 (변동성 지표)
             }
+
+    def _symbol_from_data(self, data) -> str:
+        """주어진 datafeed 객체를 종목코드(symbol)로 역매핑합니다."""
+        try:
+            idx = self.datas.index(data)
+            if 0 <= idx < len(self.selected_symbols):
+                return self.selected_symbols[idx]
+        except Exception:
+            pass
+        name = getattr(data, "_name", None)
+        return str(name) if name else ""
+
+    def _open_orders(self) -> List[Any]:
+        """Backtrader 버전 차이를 고려해 open orders를 안전하게 가져옵니다."""
+        try:
+            return list(self.broker.get_orders_open())
+        except Exception:
+            return list(getattr(self.broker, "orders", []) or [])
+
+    def _cancel_open_orders(
+        self,
+        *,
+        data=None,
+        exectypes: Optional[set[int]] = None,
+    ) -> None:
+        """지정한 조건의 open order를 취소합니다."""
+        for o in self._open_orders():
+            if data is not None and getattr(o, "data", None) is not data:
+                continue
+            if exectypes is not None and getattr(o, "exectype", None) not in exectypes:
+                continue
+            if getattr(o, "status", None) in [o.Submitted, o.Accepted]:
+                try:
+                    self.broker.cancel(o)
+                except Exception:
+                    try:
+                        self.cancel(o)
+                    except Exception:
+                        pass
+            self._order_meta.pop(getattr(o, "ref", None), None)
+
+    def _track_order(self, order, *, reason: str) -> None:
+        """주문 체결 시점에 사용할 메타데이터(사유 등)를 order.ref로 저장합니다."""
+        if order is None:
+            return
+        try:
+            self._order_meta[int(order.ref)] = {"reason": str(reason)}
+        except Exception:
+            pass
     
     def next(self):
         """
@@ -1496,41 +1599,29 @@ class PortfolioStrategy(bt.Strategy):
         Args:
             date: 리밸런싱 날짜
         """
-        # 1단계: 현재 보유 종목 청산
-        # 주의: Backtrader에서 주문은 다음 bar에서 체결되므로,
-        # getposition().size가 0일 수 있음. portfolio_positions를 기준으로 청산.
-        for symbol in list(self.portfolio_positions.keys()):
-            if symbol in self.selected_symbols:
-                idx = self.selected_symbols.index(symbol)
-                pos = self.getposition(self.datas[idx])
-                recorded_size = self.portfolio_positions.get(symbol, 0)
-                
-                # 실제 포지션이 있거나, 기록된 포지션이 있으면 청산
-                if pos.size > 0 or recorded_size > 0:
-                    self.close(data=self.datas[idx])
-                    sell_size = pos.size if pos.size > 0 else recorded_size
-                    self.log_trade(symbol, date, 'SELL', sell_size, 
-                                 self.datas[idx].close[0], '리밸런싱')
-        
-        self.portfolio_positions.clear()
-        
-        # 2단계: 새로운 종목 선택 및 매수
-        # 사용 가능한 현금을 최대 보유 종목 수로 나눔
-        num_positions = min(len(self.selected_symbols), self.params.max_positions)
-        cash_per_position = self.broker.getcash() / num_positions if num_positions > 0 else 0
-        
-        for i, symbol in enumerate(self.selected_symbols[:self.params.max_positions]):
+        # 리밸런싱 시점에는 기존 미체결 주문을 모두 취소(중복 청산/중복 스탑 방지)
+        self._cancel_open_orders()
+
+        # 1단계: 현재 보유 포지션 전량 청산 (체결은 다음 bar에서 발생)
+        for data in self.datas:
+            pos = self.getposition(data)
+            if pos.size != 0:
+                o = self.close(data=data)
+                self._track_order(o, reason="리밸런싱")
+
+        # 2단계: 매수 후보 선정 (지표 조건 > 카테고리 신호 > disclosure 코드)
+        buy_plans: List[Tuple[int, str, str]] = []
+
+        for i, symbol in enumerate(self.selected_symbols[: self.params.max_positions]):
             data = self.datas[i]
             sentiment_df = self.sentiment_data.get(symbol, pd.DataFrame())
-            
-            # 해당 날짜의 공시 정보 조회
-            date_str = date.strftime('%Y-%m-%d')
-            
-            # 지표 조건 > 카테고리 신호 > disclosure 코드 순으로 매수 결정
+
+            date_str = date.strftime("%Y-%m-%d")
+
             should_buy = False
             reason = ""
-            
-            # 1단계: 지표 조건 확인 (최우선순위)
+
+            # 1) 지표 조건 확인 (최우선순위)
             if self.use_dart and self.event_indicator_conditions:
                 indicator_df = self.indicator_data.get(symbol, pd.DataFrame())
                 if not indicator_df.empty:
@@ -1539,58 +1630,77 @@ class PortfolioStrategy(bt.Strategy):
                         indicator_signal = check_indicator_conditions(
                             indicator_df,
                             self.event_indicator_conditions,
-                            date_dt
+                            date_dt,
                         )
-                        
-                        if indicator_signal["action"] == "BUY":
+                        if indicator_signal.get("action") == "BUY":
                             should_buy = True
                             report_type = indicator_signal.get("report_type", "")
                             idc_nm = indicator_signal.get("idc_nm", "")
-                            idc_score = indicator_signal.get("idc_score", 0)
-                            reason = f'지표 조건: {report_type} ({idc_nm}={idc_score:.4f})'
-                    except Exception as e:
-                        pass  # 지표 조건 확인 실패 시 다음 단계로
-            
-            # 2단계: 지표 조건이 없으면 카테고리별 신호 확인
+                            idc_score = indicator_signal.get("idc_score", 0) or 0
+                            reason = (
+                                f"지표 조건: {report_type} ({idc_nm}={float(idc_score):.4f})"
+                            )
+                    except Exception:
+                        # 지표 조건 확인 실패 시 다음 단계로
+                        pass
+
+            # 2) 카테고리 신호 확인
             if not should_buy and self.use_dart and not sentiment_df.empty:
                 if self.category_signals or self.event_signals:
                     try:
                         date_dt = datetime.combine(date, datetime.min.time())
                         signal = generate_category_signals(
-                            sentiment_df, 
-                            self.category_signals, 
+                            sentiment_df,
+                            self.category_signals,
                             self.event_signals,
-                            date_dt
+                            date_dt,
                         )
-                        
-                        if signal["action"] == "BUY":
+                        if signal.get("action") == "BUY":
                             should_buy = True
-                            categories_str = ", ".join(signal["categories"]) if signal["categories"] else signal.get("event_type", "")
-                            reason = f'카테고리 신호: {categories_str}'
-                    except Exception as e:
+                            categories_str = (
+                                ", ".join(signal.get("categories", []) or [])
+                                if signal.get("categories")
+                                else signal.get("event_type", "")
+                            )
+                            reason = f"카테고리 신호: {categories_str}"
+                    except Exception:
                         pass
-            
-            # 3단계: 카테고리 신호가 없으면 disclosure 코드만 확인
+
+            # 3) disclosure 코드 확인
             if not should_buy and self.use_dart and not sentiment_df.empty:
                 try:
                     before_dates = sentiment_df.loc[:date_str]
                     if len(before_dates) > 0:
                         latest_event = before_dates.iloc[-1]
-                        disclosure = latest_event.get('disclosure', 0)
-                        event_type = latest_event.get('event_type', 'general')
-                        
-                        if disclosure == 1:  # 긍정적 이벤트
+                        disclosure = int(latest_event.get("disclosure", 0) or 0)
+                        event_type = latest_event.get("event_type", "general")
+                        if disclosure == 1:
                             should_buy = True
-                            reason = f'긍정 이벤트: {event_type}'
-                except:
+                            reason = f"긍정 이벤트: {event_type}"
+                except Exception:
                     pass
-            
+
             if should_buy:
-                size = int(cash_per_position / data.close[0])
-                if size > 0:
-                    self.buy(data=data, size=size)
-                    self.portfolio_positions[symbol] = size
-                    self.log_trade(symbol, date, 'BUY', size, data.close[0], reason)
+                buy_plans.append((i, symbol, reason))
+
+        # 3단계: 최종 매수 실행(총자산 기준 균등 분할)
+        if not buy_plans:
+            return
+
+        value_per_position = self.broker.getvalue() / float(len(buy_plans))
+        budget_per_position = float(value_per_position) * float(
+            getattr(self.params, "order_cash_buffer", 0.98)
+        )
+        for i, symbol, reason in buy_plans:
+            data = self.datas[i]
+            price = float(data.close[0]) if float(data.close[0]) > 0 else 0.0
+            if price <= 0:
+                continue
+            size = int(budget_per_position / price)
+            if size <= 0:
+                continue
+            o = self.buy(data=data, size=size)
+            self._track_order(o, reason=reason)
     
     def manage_position(self, symbol: str, data, date):
         """
@@ -1608,11 +1718,18 @@ class PortfolioStrategy(bt.Strategy):
         pos = self.getposition(data)
         if pos.size == 0:
             return
-        
+
+        # 이미 시장가 청산 주문이 대기 중이면 추가 주문(스탑/리밋 등)을 만들지 않음
+        for o in self._open_orders():
+            if getattr(o, "data", None) is data and getattr(o, "status", None) in [
+                o.Submitted,
+                o.Accepted,
+            ]:
+                if getattr(o, "exectype", None) == bt.Order.Market and o.issell():
+                    return
+
         sentiment_df = self.sentiment_data.get(symbol, pd.DataFrame())
-        if sentiment_df.empty:
-            return
-        
+
         # 공시 정보 조회
         date_str = date.strftime('%Y-%m-%d')
         
@@ -1676,31 +1793,42 @@ class PortfolioStrategy(bt.Strategy):
                 pass
         
         if should_sell:
-            self.close(data=data)
-            self.log_trade(symbol, date, 'SELL', pos.size, data.close[0], sell_reason)
-            if symbol in self.portfolio_positions:
-                del self.portfolio_positions[symbol]
+            # 신호 기반 청산 시에는 기존 리스크(스탑/리밋) 주문을 우선 취소
+            self._cancel_open_orders(data=data, exectypes={bt.Order.Stop, bt.Order.Limit})
+            o = self.close(data=data)
+            self._track_order(o, reason=sell_reason or "SELL 신호")
             return
         
         # 2단계: ATR 기반 스탑로스 및 이익실현 설정
         # ATR은 변동성을 나타내는 지표로, 이를 활용하여 동적 리스크 관리
         indicators = self.indicators[symbol]
-        atr = max(indicators['atr'][0], 0.1)  # 최소값 0.1로 제한
+        try:
+            atr_val = float(indicators["atr"][0])
+        except Exception:
+            atr_val = 0.0
+        if not np.isfinite(atr_val) or atr_val <= 0:
+            atr_val = 0.0
+        atr = max(atr_val, 0.1)  # 최소값 0.1로 제한
         
         # 스탑로스: 현재가 - 2*ATR
         # 이익실현: 현재가 + 3*ATR
-        stop_price = data.close[0] - 2 * atr
-        take_profit = data.close[0] + 3 * atr
+        close_px = float(data.close[0])
+        stop_price = max(close_px - 2 * atr, 0.01)
+        take_profit = close_px + 3 * atr
         
         # 기존 주문 취소 (새로운 가격으로 갱신하기 위해)
-        for order in self.broker.orders:
-            if order.data == data and order.status in [order.Submitted, order.Accepted]:
-                self.broker.cancel(order)
+        self._cancel_open_orders(data=data, exectypes={bt.Order.Stop, bt.Order.Limit})
         
         # 새로운 스탑로스 및 이익실현 주문 설정
         if pos.size > 0:
-            self.sell(data=data, exectype=bt.Order.Stop, price=stop_price, size=pos.size)
-            self.sell(data=data, exectype=bt.Order.Limit, price=take_profit, size=pos.size)
+            o_stop = self.sell(
+                data=data, exectype=bt.Order.Stop, price=stop_price, size=pos.size
+            )
+            self._track_order(o_stop, reason="ATR 스탑로스")
+            o_tp = self.sell(
+                data=data, exectype=bt.Order.Limit, price=take_profit, size=pos.size
+            )
+            self._track_order(o_tp, reason="ATR 이익실현")
     
     def log_trade(self, symbol: str, date, action: str, size: int, price: float, reason: str):
         """
@@ -1730,8 +1858,64 @@ class PortfolioStrategy(bt.Strategy):
         
         주문이 체결되거나 취소될 때 호출됩니다.
         """
-        if order.status in [order.Completed]:
-            pass  # log_trade에서 처리
+        if order.status in [order.Submitted, order.Accepted]:
+            return
+
+        # 실패/취소된 주문은 메타데이터만 정리
+        if order.status in [order.Canceled, order.Rejected, order.Margin, order.Expired]:
+            try:
+                self._order_meta.pop(int(order.ref), None)
+            except Exception:
+                pass
+            return
+
+        if order.status not in [order.Completed]:
+            return
+
+        symbol = self._symbol_from_data(getattr(order, "data", None))
+        action = "BUY" if order.isbuy() else "SELL"
+
+        # 체결 시점/가격/수량을 Backtrader 실행정보에서 추출
+        try:
+            exec_dt = bt.num2date(order.executed.dt)
+        except Exception:
+            exec_dt = datetime.combine(self.data.datetime.date(0), datetime.min.time())
+
+        try:
+            size = int(abs(order.executed.size))
+        except Exception:
+            try:
+                size = int(abs(order.created.size))
+            except Exception:
+                size = 0
+
+        try:
+            price = float(order.executed.price)
+        except Exception:
+            try:
+                price = float(order.created.price)
+            except Exception:
+                price = 0.0
+
+        if size <= 0 or price <= 0:
+            return
+
+        meta = {}
+        try:
+            meta = self._order_meta.pop(int(order.ref), {}) or {}
+        except Exception:
+            meta = {}
+        reason = meta.get("reason", "") if isinstance(meta, dict) else ""
+
+        if not reason:
+            if order.exectype == bt.Order.Stop:
+                reason = "ATR 스탑로스"
+            elif order.exectype == bt.Order.Limit:
+                reason = "ATR 이익실현"
+            elif order.exectype == bt.Order.Market:
+                reason = "시장가"
+
+        self.log_trade(symbol, exec_dt, action, size, price, reason)
 
 
 # ============================================================
@@ -2116,15 +2300,26 @@ async def run_backtest(input_params: BacktestInput) -> BacktestOutput:
     # Output 생성
     output = BacktestOutput()
     
-    # Backtrader analyzer 결과 (주문이 체결되지 않으면 0일 수 있음)
-    bt_return = returns_analyzer.get('rtot', 0.0)
-    bt_mdd = abs(drawdown_analyzer.get('max', {}).get('drawdown', 0.0)) * 100
-    bt_sharpe = sharpe_analyzer.get('sharperatio', 0.0) or 0.0
-    
-    # trades_log 기반 성과 계산 (Backtrader analyzer가 0이면 대체)
+    # Backtrader analyzer 결과
+    # - DrawDown analyzer의 max.drawdown은 backtrader 기본 구현에서 이미 % 단위로 제공되는 경우가 많습니다.
+    bt_mdd = abs(drawdown_analyzer.get("max", {}).get("drawdown", 0.0) or 0.0)
+    bt_sharpe = sharpe_analyzer.get("sharperatio", 0.0) or 0.0
+
+    # 총 수익률은 broker value 기반으로 계산(체결 유무/로그와 독립적으로 일관성 유지)
+    initial_cash = float(input_params.initial_cash or 0.0)
+    try:
+        final_value = float(strat.broker.getvalue())
+    except Exception:
+        final_value = initial_cash
+    if initial_cash > 0:
+        output.cumulative_return = final_value / initial_cash - 1.0
+        output.total_return = output.cumulative_return * 100.0
+    else:
+        output.cumulative_return = 0.0
+        output.total_return = 0.0
+
+    # trades_log 기반 성과 계산 (승률/손익/거래횟수 등)
     trades_log = strat.trades_log
-    buys = [t for t in trades_log if t['action'] == 'BUY']
-    sells = [t for t in trades_log if t['action'] == 'SELL']
     
     # BUY와 SELL을 매칭하여 손익 계산
     completed_trades = []
@@ -2159,16 +2354,11 @@ async def run_backtest(input_params: BacktestInput) -> BacktestOutput:
         win_rate_from_log = len(winning_trades) / total_trades_from_log * 100 if total_trades_from_log > 0 else 0.0
         total_profit_from_log = sum(t['pnl'] for t in winning_trades)
         total_loss_from_log = abs(sum(t['pnl'] for t in losing_trades))
-        total_pnl = sum(t['pnl'] for t in completed_trades)
-        total_return_from_log = total_pnl / input_params.initial_cash * 100
         
-        # Backtrader 결과가 0이면 trades_log 기반 결과 사용
         output.total_trades = total_trades_from_log
         output.win_rate = win_rate_from_log
         output.total_profit = total_profit_from_log
         output.total_loss = total_loss_from_log
-        output.total_return = total_return_from_log if abs(bt_return) < 0.0001 else bt_return * 100
-        output.cumulative_return = total_pnl / input_params.initial_cash if abs(bt_return) < 0.0001 else bt_return
     else:
         # trade_analyzer 사용 (fallback)
         try:
@@ -2183,21 +2373,15 @@ async def run_backtest(input_params: BacktestInput) -> BacktestOutput:
             output.win_rate = 0.0
             output.total_profit = 0.0
             output.total_loss = 0.0
-        output.total_return = bt_return * 100
-        output.cumulative_return = bt_return
     
-    # 연환산 수익률 계산 (trades_log 기반)
-    if completed_trades:
-        # 백테스트 기간 계산
-        start_dt = datetime.strptime(input_params.start_date, "%Y-%m-%d")
-        end_dt = datetime.strptime(input_params.end_date, "%Y-%m-%d")
-        years = (end_dt - start_dt).days / 365.25
-        if years > 0 and output.cumulative_return > -1:
-            output.annualized_return = ((1 + output.cumulative_return) ** (1 / years) - 1) * 100
-        else:
-            output.annualized_return = returns_analyzer.get('rnorm100', 0.0)
+    # 연환산 수익률 계산 (broker value 기반 cumulative_return 사용)
+    start_dt = datetime.strptime(input_params.start_date, "%Y-%m-%d")
+    end_dt = datetime.strptime(input_params.end_date, "%Y-%m-%d")
+    years = (end_dt - start_dt).days / 365.25
+    if years > 0 and output.cumulative_return > -1:
+        output.annualized_return = ((1 + output.cumulative_return) ** (1 / years) - 1) * 100
     else:
-        output.annualized_return = returns_analyzer.get('rnorm100', 0.0)
+        output.annualized_return = returns_analyzer.get("rnorm100", 0.0) or 0.0
     
     output.mdd = bt_mdd
     output.sharpe_ratio = bt_sharpe
@@ -2206,7 +2390,7 @@ async def run_backtest(input_params: BacktestInput) -> BacktestOutput:
     
     # 이벤트별 수익률 분석
     output.event_performance = analyze_event_performance(
-        strat.trades_log, 
+        completed_trades,
         sentiment_data, 
         price_data
     )
@@ -2236,47 +2420,100 @@ def analyze_event_performance(
     
     Args:
         trades: 거래 내역 리스트
+            - 권장: completed_trades (buy_date/sell_date/pnl 포함)
+            - 레거시: trades_log (BUY/SELL action 기반). 이 경우 내부에서 completed_trades로 변환합니다.
         sentiment_data: 종목별 감성 데이터
         price_data: 종목별 주가 데이터
     
     Returns:
         이벤트 타입별 통계 딕셔너리
     """
-    event_stats = {}
-    
-    # 거래별 이벤트 타입 추적
-    for trade in trades:
-        symbol = trade['symbol']
-        date = trade['date']
-        
-        if symbol not in sentiment_data or sentiment_data[symbol].empty:
-            continue
-        
-        # 해당 날짜의 이벤트 타입 찾기
-        date_str = pd.to_datetime(date).strftime('%Y-%m-%d')
-        sentiment_df = sentiment_data[symbol]
-        
-        if date_str in sentiment_df.index.strftime('%Y-%m-%d').values:
-            event_type = sentiment_df.loc[date_str, 'event_type']
-        else:
-            # 가장 가까운 이전 날짜
+    event_stats: Dict[str, Dict[str, Any]] = {}
+
+    # 입력이 completed_trades인지 판별
+    is_completed = bool(trades) and isinstance(trades[0], dict) and ("pnl" in trades[0])
+
+    # 레거시(trades_log) 입력이면 completed_trades로 변환
+    completed_trades: List[Dict[str, Any]] = []
+    if is_completed:
+        completed_trades = list(trades)
+    else:
+        buy_dict: Dict[str, List[Dict[str, Any]]] = {}
+        for t in trades:
+            if not isinstance(t, dict):
+                continue
+            symbol = t.get("symbol")
+            action = t.get("action")
+            if not symbol or action not in ("BUY", "SELL"):
+                continue
+            if action == "BUY":
+                buy_dict.setdefault(symbol, []).append(t)
+                continue
+            if action == "SELL":
+                if symbol in buy_dict and buy_dict[symbol]:
+                    buy_record = buy_dict[symbol].pop(0)
+                    try:
+                        pnl = (float(t.get("price", 0.0)) - float(buy_record.get("price", 0.0))) * float(
+                            t.get("size", 0.0)
+                        )
+                    except Exception:
+                        pnl = 0.0
+                    completed_trades.append(
+                        {
+                            "symbol": symbol,
+                            "buy_date": buy_record.get("date"),
+                            "sell_date": t.get("date"),
+                            "pnl": pnl,
+                        }
+                    )
+
+    # completed_trades 기반으로 이벤트별 통계 집계
+    for t in completed_trades:
+        symbol = t.get("symbol")
+        pnl = float(t.get("pnl", 0.0) or 0.0)
+        ref_date = t.get("buy_date") or t.get("date") or t.get("sell_date")
+
+        event_type = "general"
+        if symbol and symbol in sentiment_data and not sentiment_data[symbol].empty and ref_date:
+            sentiment_df = sentiment_data[symbol]
+            date_str = pd.to_datetime(ref_date).strftime("%Y-%m-%d")
             try:
-                before_dates = sentiment_df.loc[:date_str]
-                event_type = before_dates['event_type'].iloc[-1] if len(before_dates) > 0 else 'general'
-            except:
-                event_type = 'general'
-        
+                if date_str in sentiment_df.index.strftime("%Y-%m-%d").values:
+                    row = sentiment_df.loc[date_str]
+                    if isinstance(row, pd.Series):
+                        event_type = row.get("event_type", "general") or "general"
+                    else:
+                        event_type = (
+                            row["event_type"].iloc[-1] if "event_type" in row else "general"
+                        )
+                else:
+                    before_dates = sentiment_df.loc[:date_str]
+                    if len(before_dates) > 0 and "event_type" in before_dates.columns:
+                        event_type = before_dates["event_type"].iloc[-1] or "general"
+            except Exception:
+                event_type = "general"
+
+        if not event_type:
+            event_type = "general"
+
         if event_type not in event_stats:
             event_stats[event_type] = {
-                'count': 0,
-                'total_profit': 0.0,
-                'total_loss': 0.0,
-                'win_count': 0,
-                'loss_count': 0
+                "count": 0,
+                "total_profit": 0.0,
+                "total_loss": 0.0,
+                "win_count": 0,
+                "loss_count": 0,
             }
-        
-        event_stats[event_type]['count'] += 1
-    
+
+        stats = event_stats[event_type]
+        stats["count"] += 1
+        if pnl > 0:
+            stats["total_profit"] += pnl
+            stats["win_count"] += 1
+        else:
+            stats["total_loss"] += abs(pnl)
+            stats["loss_count"] += 1
+
     return event_stats
 
 
@@ -2319,7 +2556,7 @@ def generate_report(
 ## 손익 분석
 - 총 수익: {output.total_profit:,.0f}원
 - 총 손실: {output.total_loss:,.0f}원
-- 순 손익: {output.total_profit + output.total_loss:,.0f}원
+- 순 손익: {output.total_profit - output.total_loss:,.0f}원
 
 ## 이벤트별 성과
 """
@@ -2424,7 +2661,7 @@ if __name__ == "__main__":
     print(f"샤프 지수: {output.sharpe_ratio:.2f}")
     print(f"승률: {output.win_rate:.2f}%")
     print(f"총 거래 횟수: {output.total_trades}")
-    print(f"총 손익: {output.total_profit + output.total_loss:,.0f}원")
+    print(f"총 손익: {output.total_profit - output.total_loss:,.0f}원")
     
     print(f"\n거래 내역 (최근 10건):")
     for trade in output.trades[-10:]:
