@@ -53,10 +53,11 @@ async def test_process_job_happy_path(monkeypatch):
                 AuditResult(score="pass", needs_retry=False, feedback="ok")
             )
         if "report" in name:
+            from backtesting.agents.schemas import FinalNarrative
             return _DummyRunResult(
                 FinalNarrative(
                     analysis_md="report",
-                    analysis_json={"ok": True},
+                    analysis_json=[FinalNarrative.AnalysisItem(key="ok", value=True)],
                 )
             )
         raise AssertionError(f"unexpected agent name: {name}")

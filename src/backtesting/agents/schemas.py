@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -46,17 +46,6 @@ class ParsedRequest(BaseModel):
     initial_cash: Optional[float] = Field(default=None, description="초기 자본(원)")
 
     use_dart_disclosure: Optional[bool] = Field(default=None, description="DART 공시 사용 여부")
-
-    # 조건/신호는 다양한 형태가 가능하므로 dict 기반으로 유지
-    category_signals: Optional[Dict[str, Dict[str, Any]]] = Field(
-        default=None, description="카테고리별 매매 신호"
-    )
-    event_signals: Optional[Dict[str, Dict[str, Any]]] = Field(
-        default=None, description="세부 이벤트별 매매 신호"
-    )
-    event_indicator_conditions: Optional[List[Dict[str, Any]]] = Field(
-        default=None, description="공시 지표 조건 기반 매매"
-    )
 
     notes: Optional[str] = Field(default=None, description="해석 메모/불확실성")
 
@@ -119,7 +108,16 @@ class FinalNarrative(BaseModel):
     """사용자에게 저장/제공할 최종 해석/요약."""
 
     analysis_md: str = Field(description="마크다운 리포트(해석)")
-    analysis_json: Dict[str, Any] = Field(
-        default_factory=dict, description="구조화 요약(선택)"
+
+    class AnalysisItem(BaseModel):
+        """Strict schema 호환을 위해 dict 대신 key-value 리스트로 저장."""
+
+        key: str = Field(description="요약 키")
+        value: Union[str, int, float, bool, None] = Field(
+            default=None, description="요약 값"
+        )
+
+    analysis_json: List[AnalysisItem] = Field(
+        default_factory=list, description="구조화 요약(선택, key-value 리스트)"
     )
 

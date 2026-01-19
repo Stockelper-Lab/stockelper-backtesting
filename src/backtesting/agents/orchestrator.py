@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
+from datetime import date, datetime
 from typing import Any, Dict, Optional
 
 from agents import Runner, trace
@@ -99,13 +101,6 @@ def _merge_backtest_params(
         if parsed.use_dart_disclosure is not None:
             params.setdefault("use_dart_disclosure", parsed.use_dart_disclosure)
 
-        if parsed.category_signals:
-            params.setdefault("category_signals", parsed.category_signals)
-        if parsed.event_signals:
-            params.setdefault("event_signals", parsed.event_signals)
-        if parsed.event_indicator_conditions is not None:
-            params.setdefault("event_indicator_conditions", parsed.event_indicator_conditions)
-
     return params
 
 
@@ -132,6 +127,32 @@ def _apply_param_guardrails(params: Dict[str, Any]) -> Dict[str, Any]:
         # 최종적으로도 비어 있으면 실패 처리.
         pass
 
+    # 날짜 포맷 검증(LLM 출력이 비정형이면 제거 후, query 기반 보정에 맡김)
+    def _valid_date(s: Any) -> bool:
+        if not isinstance(s, str) or not s.strip():
+            return False
+        try:
+            datetime.strptime(s.strip(), "%Y-%m-%d")
+            return True
+        except Exception:
+            return False
+
+    sd = params.get("start_date")
+    ed = params.get("end_date")
+    if sd is not None and not _valid_date(sd):
+        params.pop("start_date", None)
+    if ed is not None and not _valid_date(ed):
+        params.pop("end_date", None)
+    sd2 = params.get("start_date")
+    ed2 = params.get("end_date")
+    if _valid_date(sd2) and _valid_date(ed2):
+        try:
+            if str(sd2) > str(ed2):
+                # YYYY-MM-DD 문자열은 사전식 비교가 날짜 비교와 동일
+                params["start_date"], params["end_date"] = str(ed2), str(sd2)
+        except Exception:
+            pass
+
     # 상한/기본값
     max_positions = params.get("max_positions")
     try:
@@ -150,6 +171,75 @@ def _apply_param_guardrails(params: Dict[str, Any]) -> Dict[str, Any]:
         params.pop("max_portfolio_size", None)
 
     # use_dart_disclosure 기본 true 유지(엔진 기본값에 위임)
+    return params
+
+
+def _extract_corp_names_from_query(query: Optional[str]) -> list[str]:
+    """자연어 요청에서 회사명 후보를 결정적으로 추출(LLM 보조 실패 대비)."""
+    if not query or not isinstance(query, str):
+        return []
+
+    parts = [p.strip() for p in query.split(",") if p and p.strip()]
+    if not parts:
+        return []
+
+    # 마지막 조각에 붙는 기간/요청 문구 제거
+    last = parts[-1]
+    last = re.split(r"\b\d+\s*년", last, maxsplit=1)[0].strip()
+    last = re.split(r"\b백테", last, maxsplit=1)[0].strip()
+    if last:
+        parts[-1] = last
+
+    cleaned: list[str] = []
+    for p in parts:
+        s = p.strip()
+        if not s:
+            continue
+        # (주), ㈜ 변형 제거 (DB corp_name 매칭률 향상)
+        s = s.replace("㈜", "").replace("(주)", "").replace("주)", "").replace("(주", "")
+        s = s.strip()
+        if len(s) >= 2:
+            cleaned.append(s)
+    # unique preserve order
+    seen = set()
+    out: list[str] = []
+    for s in cleaned:
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out[:20]
+
+
+def _maybe_apply_years_range_from_query(params: Dict[str, Any], query: Optional[str]) -> Dict[str, Any]:
+    """query에 'N년치'가 있고 start/end가 비어있으면 결정적으로 채웁니다."""
+    if not query or not isinstance(query, str):
+        return params
+    if params.get("start_date") and params.get("end_date"):
+        return params
+
+    m = re.search(r"(\d+)\s*년", query)
+    if not m:
+        return params
+
+    try:
+        years = int(m.group(1))
+    except Exception:
+        return params
+    if years <= 0 or years > 30:
+        return params
+
+    today = date.today()
+    end_s = today.isoformat()
+    start_year = today.year - years
+    # 윤년 등 안전 처리
+    try:
+        start_s = today.replace(year=start_year).isoformat()
+    except Exception:
+        start_s = date(start_year, today.month, 1).isoformat()
+
+    params.setdefault("end_date", end_s)
+    params.setdefault("start_date", start_s)
     return params
 
 
@@ -244,6 +334,7 @@ async def process_job(job: Dict[str, Any]) -> None:
             # 2) BacktestInput dict 구성
             backtest_params = _merge_backtest_params(payload=payload, parsed=parsed)
             backtest_params = _apply_param_guardrails(backtest_params)
+            backtest_params = _maybe_apply_years_range_from_query(backtest_params, query)
 
             # 3) 종목 해석/보강(회사명/쿼리 -> 종목코드)
             allow_full = _to_bool(os.getenv("ALLOW_FULL_UNIVERSE"), default=False)
@@ -254,6 +345,10 @@ async def process_job(job: Dict[str, Any]) -> None:
                 target_corp_names = [target_corp_names]
             if not isinstance(target_corp_names, list):
                 target_corp_names = []
+
+            # LLM 파서가 corp_names를 못 뽑아도, query 기반으로 후보를 보강
+            if not target_corp_names and query:
+                target_corp_names = _extract_corp_names_from_query(query)
 
             if (not target_symbols) and (target_corp_names or query):
                 resolved = resolve_symbols_impl(corp_names=target_corp_names, query=query)
@@ -363,9 +458,27 @@ async def process_job(job: Dict[str, Any]) -> None:
                 "output_summary": output_summary,
                 "trades_head": (output_dict.get("trades") or [])[:200],
             }
-            report_run = await Runner.run(report_agent, _json_dumps(report_input), context=ctx)
-            narrative = report_run.final_output_as(FinalNarrative)
-            report_elapsed = time.time() - report_t0
+            analysis_md: Optional[str] = None
+            analysis_json_dict: Optional[Dict[str, Any]] = None
+            report_elapsed: Optional[float] = None
+            try:
+                report_run = await Runner.run(report_agent, _json_dumps(report_input), context=ctx)
+                narrative = report_run.final_output_as(FinalNarrative)
+                report_elapsed = time.time() - report_t0
+
+                analysis_md = narrative.analysis_md
+                analysis_json_dict2: Dict[str, Any] = {}
+                for item in getattr(narrative, "analysis_json", []) or []:
+                    k = getattr(item, "key", None)
+                    v = getattr(item, "value", None)
+                    if isinstance(k, str) and k.strip():
+                        analysis_json_dict2[k.strip()] = v
+                analysis_json_dict = analysis_json_dict2
+            except Exception:
+                # 리포트 생성은 best-effort: 실패해도 백테스트 결과는 completed로 적재합니다.
+                analysis_md = None
+                analysis_json_dict = None
+                report_elapsed = None
 
             # 6) Persist
             elapsed = time.time() - t0
@@ -375,8 +488,8 @@ async def process_job(job: Dict[str, Any]) -> None:
                 result_file_path=files.get("result_file_path"),
                 report_file_path=files.get("report_file_path"),
                 elapsed_seconds=elapsed,
-                analysis_md=narrative.analysis_md,
-                analysis_json=narrative.analysis_json,
+                analysis_md=analysis_md,
+                analysis_json=analysis_json_dict,
                 analysis_model=os.getenv("BACKTEST_AGENT_MODEL_REPORT") or None,
                 analysis_prompt_version=prompt_version,
                 analysis_elapsed_seconds=report_elapsed,
