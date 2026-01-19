@@ -317,7 +317,8 @@ async def process_job(job: Dict[str, Any]) -> None:
         with trace(
             "Stockelper Backtesting Agent",
             group_id=job_id,
-            metadata={"job_id": job_id, "user_id": user_id},
+            # Agents tracing metadata는 string 값을 기대합니다(OpenAI API validation).
+            metadata={"job_id": str(job_id), "user_id": str(user_id)},
         ):
             # 1) Parse(필요 시)
             parsed: ParsedRequest | None = None
