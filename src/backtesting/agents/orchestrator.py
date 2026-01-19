@@ -222,9 +222,7 @@ async def process_job(job: Dict[str, Any]) -> None:
 
     try:
         if not (os.getenv("OPENAI_API_KEY") or "").strip():
-            raise RuntimeError(
-                "BACKTEST_USE_AGENTS=true 이지만 OPENAI_API_KEY가 설정되어 있지 않습니다."
-            )
+            raise RuntimeError("OPENAI_API_KEY가 설정되어 있지 않습니다. (Agents-only worker)")
 
         with trace(
             "Stockelper Backtesting Agent",

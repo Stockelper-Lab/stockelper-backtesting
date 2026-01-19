@@ -87,10 +87,17 @@ DEBUG=false
 BACKTEST_WORKER_POLL_SECONDS=5   # 폴링 간격
 BACKTEST_RESULTS_DIR=outputs/backtesting_results  # 결과 파일 저장 위치
 
-# (선택) LLM 해석 자동화
-# - 백테스트 완료 직후, LLM 서버에 해석 생성을 요청합니다.
-STOCKELPER_LLM_URL=http://54.180.25.182:21009
-BACKTEST_LLM_TRIGGER_TIMEOUT=10
+# OpenAI Agents SDK (필수)
+# - 워커는 Agents 파이프라인으로만 동작합니다.
+OPENAI_API_KEY=sk-...
+
+# (선택) Agents 설정
+BACKTEST_AGENT_MAX_RETRIES=2
+BACKTEST_AGENT_PROMPT_VERSION=v1
+BACKTEST_AGENT_MODEL_PARSE=
+BACKTEST_AGENT_MODEL_ADJUST=
+BACKTEST_AGENT_MODEL_AUDIT=
+BACKTEST_AGENT_MODEL_REPORT=
 ```
 
 ## 🚀 빠른 시작
@@ -118,20 +125,14 @@ docker-compose logs -f backtest-worker
 
 ## 🔄 워커 동작
 
-### 폴링 기반 작업 처리
+### 폴링 기반 작업 처리 (Agents-only)
 1. `BACKTEST_WORKER_POLL_SECONDS`마다 DB 폴링
 2. `SELECT ... FOR UPDATE SKIP LOCKED`로 작업 예약
 3. 상태를 `pending` → `in_progress`로 변경
-4. `portfolio_backtest.run_backtest()` 실행
-5. 결과(JSON/Markdown) 파일 저장
-6. 상태를 `completed`(또는 `failed`)로 변경 + 파일 경로 업데이트
-
-### (선택) OpenAI Agents SDK 기반 오케스트레이션
-- `BACKTEST_USE_AGENTS=true`를 설정하면 워커가 아래 단계를 추가로 수행합니다:
-  - 입력 파싱(LLM) → 데이터 사전검증(preflight) → 실행 → 결과 감사(audit) → 리포트(LLM) → DB 적재(analysis_* 포함)
-- 필요 환경변수:
-  - `OPENAI_API_KEY`
-  - (선택) `BACKTEST_AGENT_MODEL_PARSE/ADJUST/AUDIT/REPORT`, `BACKTEST_AGENT_MAX_RETRIES`
+4. OpenAI Agents SDK 파이프라인 실행:
+  - 입력 파싱(LLM) → 가드레일 → 데이터 사전검증(preflight) → 실행(run_backtest) → 결과 감사(audit) → 리포트(LLM)
+5. 결과(JSON/Markdown) 파일 저장 + 상태 업데이트(`completed`/`failed`)
+6. 리포트/요약을 DB 컬럼(`analysis_*`)에 함께 적재
 
 ### 별도 실행
 

@@ -7,26 +7,15 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from agents import (
-    RunContextWrapper,
-    ToolGuardrailFunctionOutput,
-    function_tool,
-    tool_input_guardrail,
-    tool_output_guardrail,
-)
 from sqlalchemy import text
 
 from backtesting.agents.schemas import (
-    BacktestAgentContext,
     DartCoverage,
     PreflightReport,
     PriceCoverage,
 )
 from backtesting.portfolio_backtest import BacktestInput, DataLoader, run_backtest
 from backtesting.web_db import mark_job_completed_with_analysis, mark_job_failed
-
-_SECRET_RE = re.compile(r"\bsk-[A-Za-z0-9]{10,}\b")
-_PG_DSN_RE = re.compile(r"\bpostgresql(\+[\w]+)?://[^\s]+\b", re.IGNORECASE)
 
 
 def _safe_date_str(v: Any) -> Optional[str]:
@@ -47,34 +36,6 @@ def _normalize_symbol(x: Any) -> Optional[str]:
     if len(s) == 6 and s.isdigit():
         return s
     return None
-
-
-@tool_input_guardrail
-def _block_secrets_in_tool_args(data) -> ToolGuardrailFunctionOutput:
-    """도구 호출 인자에 민감정보가 섞이면 거부합니다."""
-    args = {}
-    try:
-        args = json.loads(data.context.tool_arguments or "{}")
-    except Exception:
-        args = {"raw": data.context.tool_arguments}
-
-    blob = json.dumps(args, ensure_ascii=False, default=str)
-    if _SECRET_RE.search(blob) or _PG_DSN_RE.search(blob):
-        return ToolGuardrailFunctionOutput.reject_content(
-            "도구 인자에 민감정보가 포함되어 호출을 차단했습니다."
-        )
-    return ToolGuardrailFunctionOutput.allow()
-
-
-@tool_output_guardrail
-def _block_secrets_in_tool_output(data) -> ToolGuardrailFunctionOutput:
-    """도구 출력에 민감정보가 섞이면 거부합니다."""
-    text_out = str(data.output or "")
-    if _SECRET_RE.search(text_out) or _PG_DSN_RE.search(text_out):
-        return ToolGuardrailFunctionOutput.reject_content(
-            "도구 출력에 민감정보가 포함되어 차단했습니다."
-        )
-    return ToolGuardrailFunctionOutput.allow()
 
 
 def _output_to_dict(output: Any) -> Dict[str, Any]:
@@ -207,18 +168,6 @@ def resolve_symbols_impl(
     return {"symbols": unique, "mapping_log": mapping_log}
 
 
-@function_tool(
-    tool_input_guardrails=[_block_secrets_in_tool_args],
-    tool_output_guardrails=[_block_secrets_in_tool_output],
-)
-def resolve_symbols(
-    ctx: RunContextWrapper[BacktestAgentContext],
-    corp_names: Optional[List[str]] = None,
-    query: Optional[str] = None,
-) -> Dict[str, Any]:
-    return resolve_symbols_impl(corp_names=corp_names, query=query)
-
-
 def preflight_data_check_impl(*, backtest_params: Dict[str, Any]) -> Dict[str, Any]:
     """백테스트 실행 전, 가격/공시 데이터 커버리지를 빠르게 점검합니다."""
 
@@ -325,50 +274,16 @@ def preflight_data_check_impl(*, backtest_params: Dict[str, Any]) -> Dict[str, A
     return report.model_dump()
 
 
-@function_tool(
-    tool_input_guardrails=[_block_secrets_in_tool_args],
-    tool_output_guardrails=[_block_secrets_in_tool_output],
-)
-def preflight_data_check(
-    ctx: RunContextWrapper[BacktestAgentContext],
-    backtest_params: Dict[str, Any],
-) -> Dict[str, Any]:
-    return preflight_data_check_impl(backtest_params=backtest_params)
-
-
 async def run_backtest_impl(*, backtest_params: Dict[str, Any]) -> Dict[str, Any]:
     bt = BacktestInput(**backtest_params)
     output = await run_backtest(bt)
     return _output_to_dict(output)
 
 
-@function_tool(
-    tool_input_guardrails=[_block_secrets_in_tool_args],
-    tool_output_guardrails=[_block_secrets_in_tool_output],
-)
-async def run_backtest_tool(
-    ctx: RunContextWrapper[BacktestAgentContext],
-    backtest_params: Dict[str, Any],
-) -> Dict[str, Any]:
-    return await run_backtest_impl(backtest_params=backtest_params)
-
-
 def build_artifacts_impl(*, job_id: str, output_dict: Dict[str, Any]) -> Dict[str, Any]:
     files = _write_artifacts(job_id=job_id, output_dict=output_dict)
     summary = _build_output_summary(output_dict)
     return {"files": files, "summary": summary}
-
-
-@function_tool(
-    tool_input_guardrails=[_block_secrets_in_tool_args],
-    tool_output_guardrails=[_block_secrets_in_tool_output],
-)
-def build_artifacts_tool(
-    ctx: RunContextWrapper[BacktestAgentContext],
-    job_id: str,
-    output_dict: Dict[str, Any],
-) -> Dict[str, Any]:
-    return build_artifacts_impl(job_id=job_id, output_dict=output_dict)
 
 
 async def persist_completed_impl(
@@ -398,58 +313,10 @@ async def persist_completed_impl(
     )
 
 
-@function_tool(
-    tool_input_guardrails=[_block_secrets_in_tool_args],
-    tool_output_guardrails=[_block_secrets_in_tool_output],
-)
-async def persist_completed_tool(
-    ctx: RunContextWrapper[BacktestAgentContext],
-    *,
-    job_id: str,
-    output_json: Dict[str, Any],
-    result_file_path: Optional[str],
-    report_file_path: Optional[str],
-    elapsed_seconds: Optional[float],
-    analysis_md: Optional[str],
-    analysis_json: Optional[Dict[str, Any]],
-    analysis_model: Optional[str],
-    analysis_prompt_version: Optional[str],
-    analysis_elapsed_seconds: Optional[float],
-) -> bool:
-    return await persist_completed_impl(
-        job_id=job_id,
-        output_json=output_json,
-        result_file_path=result_file_path,
-        report_file_path=report_file_path,
-        elapsed_seconds=elapsed_seconds,
-        analysis_md=analysis_md,
-        analysis_json=analysis_json,
-        analysis_model=analysis_model,
-        analysis_prompt_version=analysis_prompt_version,
-        analysis_elapsed_seconds=analysis_elapsed_seconds,
-    )
-
-
 async def persist_failed_impl(
     *, job_id: str, error_message: str, elapsed_seconds: Optional[float]
 ) -> bool:
     return await mark_job_failed(
         job_id=job_id, error_message=str(error_message), elapsed_seconds=elapsed_seconds
-    )
-
-
-@function_tool(
-    tool_input_guardrails=[_block_secrets_in_tool_args],
-    tool_output_guardrails=[_block_secrets_in_tool_output],
-)
-async def persist_failed_tool(
-    ctx: RunContextWrapper[BacktestAgentContext],
-    *,
-    job_id: str,
-    error_message: str,
-    elapsed_seconds: Optional[float],
-) -> bool:
-    return await persist_failed_impl(
-        job_id=job_id, error_message=error_message, elapsed_seconds=elapsed_seconds
     )
 
